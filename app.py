@@ -1,5 +1,4 @@
 import os
-import re
 import logging
 import traceback
 import requests
@@ -33,23 +32,31 @@ SYSTEM_PROMPT = (
     "and cite the source URLs where relevant."
 )
 
-# Trigger a web search when the message contains time-sensitive keywords
-_SEARCH_RE = re.compile(
-    r"\b(today|tonight|yesterday|this (week|month|year)|"
-    r"currently?|right now|latest|recent|just now|"
-    r"weather|temperature|forecast|"
-    r"price|stock|crypto|bitcoin|exchange rate|"
-    r"news|headline|breaking|"
-    r"score|who (won|wins)|winner|champion|season|finals?|playoffs?|"
-    r"202[3-9]|20[3-9]\d)\b"
-    r"|今[天日]|最[新近]|現在|目前|剛才|"
-    r"天[氣気]|新聞|比賽|誰贏|結果|價格|股[價市]|匯率|氣溫",
-    re.IGNORECASE,
+ROUTER_PROMPT = (
+    "You are a routing assistant. "
+    "Does the user's message require a real-time web search to answer accurately? "
+    "(e.g. current news, weather, live scores, recent prices, ongoing events) "
+    "Reply with exactly YES or NO — nothing else."
 )
 
 
-def needs_search(text: str) -> bool:
-    return bool(_SEARCH_RE.search(text))
+def needs_search(user_text: str) -> bool:
+    try:
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": ROUTER_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            max_tokens=3,
+            temperature=0,
+        )
+        decision = response.choices[0].message.content.strip().upper()
+        log.info("Search routing: '%s' → %s", user_text[:60], decision)
+        return decision.startswith("YES")
+    except Exception:
+        log.warning("Router call failed, skipping search:\n%s", traceback.format_exc())
+        return False
 
 
 def web_search(query: str) -> str:
