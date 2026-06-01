@@ -1,12 +1,12 @@
 import os
-import json
+import re
 import logging
 import traceback
 import requests
 import telebot
 from flask import Flask, request, jsonify
 from groq import Groq
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,37 +25,31 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 SYSTEM_PROMPT = (
-    "You are a smart, helpful AI assistant with access to a web search tool. "
-    "Use web_search whenever the user asks about current events, news, prices, weather, "
-    "sports scores, or anything that may have changed recently. "
-    "Always reply in the same language the user writes in."
+    "You are a helpful AI assistant. "
+    "Always reply in the same language the user writes in — "
+    "if they write in Traditional Chinese (繁體中文), reply entirely in Traditional Chinese; "
+    "if they write in English, reply in English. "
+    "When web search results are provided, use them to give accurate, up-to-date answers "
+    "and cite the source URLs where relevant."
 )
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Search the internet for up-to-date information.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query"}
-                },
-                "required": ["query"],
-            },
-        },
-    }
-]
-
-# Per-user message history (user/assistant turns only)
-chat_histories: dict[int, list[dict]] = {}
+# Trigger a web search when the message contains time-sensitive keywords
+_SEARCH_RE = re.compile(
+    r"\b(today|tonight|yesterday|this (week|month|year)|"
+    r"currently?|right now|latest|recent|just now|"
+    r"weather|temperature|forecast|"
+    r"price|stock|crypto|bitcoin|exchange rate|"
+    r"news|headline|breaking|"
+    r"score|who (won|wins)|winner|champion|season|finals?|playoffs?|"
+    r"202[3-9]|20[3-9]\d)\b"
+    r"|今[天日]|最[新近]|現在|目前|剛才|"
+    r"天[氣気]|新聞|比賽|誰贏|結果|價格|股[價市]|匯率|氣溫",
+    re.IGNORECASE,
+)
 
 
-def get_history(user_id: int) -> list[dict]:
-    if user_id not in chat_histories:
-        chat_histories[user_id] = []
-    return chat_histories[user_id]
+def needs_search(text: str) -> bool:
+    return bool(_SEARCH_RE.search(text))
 
 
 def web_search(query: str) -> str:
@@ -71,10 +65,30 @@ def web_search(query: str) -> str:
         return f"Search failed: {e}"
 
 
+# Per-user message history (user/assistant turns only)
+chat_histories: dict[int, list[dict]] = {}
+
+
+def get_history(user_id: int) -> list[dict]:
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
+    return chat_histories[user_id]
+
+
 def chat(user_id: int, user_text: str) -> str:
     history = get_history(user_id)
+
+    system = SYSTEM_PROMPT
+    if needs_search(user_text):
+        log.info("Search triggered for: %s", user_text[:80])
+        results = web_search(user_text)
+        system += (
+            f"\n\nWeb search results for the user's query:\n{results}\n"
+            "Use the above results to answer accurately."
+        )
+
     messages = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": system}]
         + history
         + [{"role": "user", "content": user_text}]
     )
@@ -82,68 +96,23 @@ def chat(user_id: int, user_text: str) -> str:
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
         max_tokens=4096,
     )
-    msg = response.choices[0].message
+    reply = response.choices[0].message.content
 
-    if msg.tool_calls:
-        tool_results = []
-        for tc in msg.tool_calls:
-            args = json.loads(tc.function.arguments)
-            log.info("Web search: %s", args["query"])
-            result = web_search(args["query"])
-            tool_results.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
-
-        # Second call: give the model the search results
-        second_messages = messages + [
-            {
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ],
-            }
-        ] + tool_results
-
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=second_messages,
-            max_tokens=4096,
-        )
-        reply = response.choices[0].message.content
-    else:
-        reply = msg.content
-
-    # Store only clean user/assistant turns in history
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": reply})
     return reply
 
 
 def send_reply(message: telebot.types.Message, text: str):
-    """Split and send text that may exceed Telegram's 4096-char limit."""
     limit = 4096
     if len(text) <= limit:
         bot.reply_to(message, text)
         return
-    # Send first chunk as reply, rest as follow-up messages
     bot.reply_to(message, text[:limit])
     for i in range(limit, len(text), limit):
-        bot.send_message(message.chat.id, text[i:i + limit])
+        bot.send_message(message.chat.id, text[i : i + limit])
 
 
 @bot.message_handler(commands=["start"])
@@ -235,7 +204,6 @@ def debug():
         "GROQ_API_KEY": "set" if GROQ_API_KEY else "MISSING",
     }
 
-    log.info("Debug endpoint called: %s", info)
     return jsonify(info)
 
 
