@@ -4,7 +4,7 @@ import traceback
 import requests
 import telebot
 from flask import Flask, request, jsonify
-from google import genai
+from groq import Groq
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,20 +16,33 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = "gemini-2.0-flash"
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-gemini = genai.Client(api_key=GEMINI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Per-user chat sessions (in-memory; resets on server restart)
-chat_sessions: dict[int, genai.chats.Chat] = {}
+# Per-user message history for multi-turn conversation
+chat_histories: dict[int, list[dict]] = {}
 
 
-def get_chat_session(user_id: int) -> genai.chats.Chat:
-    if user_id not in chat_sessions:
-        chat_sessions[user_id] = gemini.chats.create(model=GEMINI_MODEL)
-    return chat_sessions[user_id]
+def get_history(user_id: int) -> list[dict]:
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
+    return chat_histories[user_id]
+
+
+def chat(user_id: int, user_text: str) -> str:
+    history = get_history(user_id)
+    history.append({"role": "user", "content": user_text})
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=history,
+        max_tokens=2048,
+    )
+    reply = response.choices[0].message.content
+    history.append({"role": "assistant", "content": reply})
+    return reply
 
 
 @bot.message_handler(commands=["start"])
@@ -37,8 +50,8 @@ def handle_start(message: telebot.types.Message):
     log.info("Received /start from user %s", message.from_user.id)
     bot.reply_to(
         message,
-        "Hi! I'm your Gemini AI assistant.\n"
-        "Just send me any message and I'll reply using Google Gemini.\n\n"
+        "Hi! I'm your AI assistant powered by Llama 3.3 70B via Groq.\n"
+        "Just send me any message and I'll reply.\n\n"
         "Commands:\n"
         "/reset — Clear conversation history\n"
         "/start — Show this message",
@@ -48,7 +61,7 @@ def handle_start(message: telebot.types.Message):
 @bot.message_handler(commands=["reset"])
 def handle_reset(message: telebot.types.Message):
     log.info("Received /reset from user %s", message.from_user.id)
-    chat_sessions.pop(message.from_user.id, None)
+    chat_histories.pop(message.from_user.id, None)
     bot.reply_to(message, "Conversation reset! Starting fresh.")
 
 
@@ -61,10 +74,9 @@ def handle_message(message: telebot.types.Message):
     bot.send_chat_action(message.chat.id, "typing")
 
     try:
-        chat = get_chat_session(user_id)
-        response = chat.send_message(user_text)
-        log.info("Gemini replied (%d chars)", len(response.text))
-        bot.reply_to(message, response.text)
+        reply = chat(user_id, user_text)
+        log.info("Groq replied (%d chars)", len(reply))
+        bot.reply_to(message, reply)
     except Exception:
         log.error("Error handling message:\n%s", traceback.format_exc())
         bot.reply_to(message, "Sorry, something went wrong. Check server logs.")
@@ -105,20 +117,22 @@ def debug():
     except Exception:
         info["webhook"] = {"error": traceback.format_exc()}
 
-    # 2. Quick Gemini smoke test
+    # 2. Quick Groq smoke test
     try:
-        resp = gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents="Reply with exactly: OK",
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": "Reply with exactly: OK"}],
+            max_tokens=10,
         )
-        info["gemini"] = {"status": "ok", "model": GEMINI_MODEL, "reply": resp.text.strip()}
+        reply = response.choices[0].message.content.strip()
+        info["groq"] = {"status": "ok", "model": GROQ_MODEL, "reply": reply}
     except Exception:
-        info["gemini"] = {"status": "error", "model": GEMINI_MODEL, "detail": traceback.format_exc()}
+        info["groq"] = {"status": "error", "model": GROQ_MODEL, "detail": traceback.format_exc()}
 
     # 3. Env var presence check
     info["env"] = {
         "TELEGRAM_BOT_TOKEN": "set" if TELEGRAM_BOT_TOKEN else "MISSING",
-        "GEMINI_API_KEY": "set" if GEMINI_API_KEY else "MISSING",
+        "GROQ_API_KEY": "set" if GROQ_API_KEY else "MISSING",
     }
 
     log.info("Debug endpoint called: %s", info)
@@ -127,7 +141,7 @@ def debug():
 
 @app.route("/", methods=["GET"])
 def health():
-    return "Gemini Telegram Bot is running."
+    return "Groq Telegram Bot is running."
 
 
 if __name__ == "__main__":
