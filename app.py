@@ -4,7 +4,7 @@ import traceback
 import requests
 import telebot
 from flask import Flask, request, jsonify
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,19 +17,18 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_MODEL = "gemini-2.0-flash"
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
-
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+gemini = genai.Client(api_key=GEMINI_API_KEY)
 
 # Per-user chat sessions (in-memory; resets on server restart)
-chat_sessions: dict[int, genai.ChatSession] = {}
+chat_sessions: dict[int, genai.chats.Chat] = {}
 
 
-def get_chat_session(user_id: int) -> genai.ChatSession:
+def get_chat_session(user_id: int) -> genai.chats.Chat:
     if user_id not in chat_sessions:
-        chat_sessions[user_id] = model.start_chat(history=[])
+        chat_sessions[user_id] = gemini.chats.create(model=GEMINI_MODEL)
     return chat_sessions[user_id]
 
 
@@ -88,7 +87,6 @@ def webhook():
 
 @app.route("/debug", methods=["GET"])
 def debug():
-    """Returns webhook status and a live Gemini test — safe to share publicly."""
     info: dict = {}
 
     # 1. Check Telegram webhook info
@@ -109,12 +107,15 @@ def debug():
 
     # 2. Quick Gemini smoke test
     try:
-        resp = model.generate_content("Reply with exactly: OK")
-        info["gemini"] = {"status": "ok", "reply": resp.text.strip()}
+        resp = gemini.models.generate_content(
+            model=GEMINI_MODEL,
+            contents="Reply with exactly: OK",
+        )
+        info["gemini"] = {"status": "ok", "model": GEMINI_MODEL, "reply": resp.text.strip()}
     except Exception:
-        info["gemini"] = {"status": "error", "detail": traceback.format_exc()}
+        info["gemini"] = {"status": "error", "model": GEMINI_MODEL, "detail": traceback.format_exc()}
 
-    # 3. Env var presence (never log the actual values)
+    # 3. Env var presence check
     info["env"] = {
         "TELEGRAM_BOT_TOKEN": "set" if TELEGRAM_BOT_TOKEN else "MISSING",
         "GEMINI_API_KEY": "set" if GEMINI_API_KEY else "MISSING",
