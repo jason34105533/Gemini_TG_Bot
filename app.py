@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL = "deepseek-r1-distill-llama-70b"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False)
 groq_client = Groq(api_key=GROQ_API_KEY)
