@@ -21,7 +21,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-2.0-flash")
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 # Per-user chat sessions (in-memory; resets on server restart)
 chat_sessions: dict[int, genai.ChatSession] = {}
