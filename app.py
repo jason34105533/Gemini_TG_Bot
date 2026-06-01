@@ -1,10 +1,12 @@
 import os
+import json
 import logging
 import traceback
 import requests
 import telebot
 from flask import Flask, request, jsonify
 from groq import Groq
+from duckduckgo_search import DDGS
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,12 +19,36 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "deepseek-r1-distill-llama-70b"
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Per-user message history for multi-turn conversation
+SYSTEM_PROMPT = (
+    "You are a smart, helpful AI assistant with access to a web search tool. "
+    "Use web_search whenever the user asks about current events, news, prices, weather, "
+    "sports scores, or anything that may have changed recently. "
+    "Always reply in the same language the user writes in."
+)
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the internet for up-to-date information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"}
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
+
+# Per-user message history (user/assistant turns only)
 chat_histories: dict[int, list[dict]] = {}
 
 
@@ -32,17 +58,92 @@ def get_history(user_id: int) -> list[dict]:
     return chat_histories[user_id]
 
 
+def web_search(query: str) -> str:
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+        if not results:
+            return "No results found."
+        return "\n\n".join(
+            f"{r['title']}\n{r['body']}\nURL: {r['href']}" for r in results
+        )
+    except Exception as e:
+        return f"Search failed: {e}"
+
+
 def chat(user_id: int, user_text: str) -> str:
     history = get_history(user_id)
-    history.append({"role": "user", "content": user_text})
+    messages = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + history
+        + [{"role": "user", "content": user_text}]
+    )
+
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
-        messages=history,
-        max_tokens=2048,
+        messages=messages,
+        tools=TOOLS,
+        tool_choice="auto",
+        max_tokens=4096,
     )
-    reply = response.choices[0].message.content
+    msg = response.choices[0].message
+
+    if msg.tool_calls:
+        tool_results = []
+        for tc in msg.tool_calls:
+            args = json.loads(tc.function.arguments)
+            log.info("Web search: %s", args["query"])
+            result = web_search(args["query"])
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            })
+
+        # Second call: give the model the search results
+        second_messages = messages + [
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            }
+        ] + tool_results
+
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=second_messages,
+            max_tokens=4096,
+        )
+        reply = response.choices[0].message.content
+    else:
+        reply = msg.content
+
+    # Store only clean user/assistant turns in history
+    history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": reply})
     return reply
+
+
+def send_reply(message: telebot.types.Message, text: str):
+    """Split and send text that may exceed Telegram's 4096-char limit."""
+    limit = 4096
+    if len(text) <= limit:
+        bot.reply_to(message, text)
+        return
+    # Send first chunk as reply, rest as follow-up messages
+    bot.reply_to(message, text[:limit])
+    for i in range(limit, len(text), limit):
+        bot.send_message(message.chat.id, text[i:i + limit])
 
 
 @bot.message_handler(commands=["start"])
@@ -50,9 +151,8 @@ def handle_start(message: telebot.types.Message):
     log.info("Received /start from user %s", message.from_user.id)
     bot.reply_to(
         message,
-        "Hi! I'm your AI assistant powered by Llama 3.3 70B via Groq.\n"
-        "Just send me any message and I'll reply.\n\n"
-        "Commands:\n"
+        "Hi! I'm your AI assistant.\n"
+        "I can answer questions and search the web for current info.\n\n"
         "/reset — Clear conversation history\n"
         "/start — Show this message",
     )
@@ -75,8 +175,8 @@ def handle_message(message: telebot.types.Message):
 
     try:
         reply = chat(user_id, user_text)
-        log.info("Groq replied (%d chars)", len(reply))
-        bot.reply_to(message, reply)
+        log.info("Reply sent (%d chars)", len(reply))
+        send_reply(message, reply)
     except Exception:
         log.error("Error handling message:\n%s", traceback.format_exc())
         bot.reply_to(message, "Sorry, something went wrong. Check server logs.")
@@ -101,7 +201,6 @@ def webhook():
 def debug():
     info: dict = {}
 
-    # 1. Check Telegram webhook info
     try:
         r = requests.get(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo",
@@ -117,19 +216,20 @@ def debug():
     except Exception:
         info["webhook"] = {"error": traceback.format_exc()}
 
-    # 2. Quick Groq smoke test
     try:
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[{"role": "user", "content": "Reply with exactly: OK"}],
             max_tokens=10,
         )
-        reply = response.choices[0].message.content.strip()
-        info["groq"] = {"status": "ok", "model": GROQ_MODEL, "reply": reply}
+        info["groq"] = {
+            "status": "ok",
+            "model": GROQ_MODEL,
+            "reply": response.choices[0].message.content.strip(),
+        }
     except Exception:
         info["groq"] = {"status": "error", "model": GROQ_MODEL, "detail": traceback.format_exc()}
 
-    # 3. Env var presence check
     info["env"] = {
         "TELEGRAM_BOT_TOKEN": "set" if TELEGRAM_BOT_TOKEN else "MISSING",
         "GROQ_API_KEY": "set" if GROQ_API_KEY else "MISSING",
@@ -141,7 +241,7 @@ def debug():
 
 @app.route("/", methods=["GET"])
 def health():
-    return "Groq Telegram Bot is running."
+    return "AI Telegram Bot is running."
 
 
 if __name__ == "__main__":
